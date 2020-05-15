@@ -396,10 +396,10 @@ namespace NBitcoin
 
 			internal Key? FindKey(Script scriptPubKey)
 			{
-				var key = Builder._Keys
+				Key? key = Builder._Keys
 					.Concat(AdditionalKeys)
 					.FirstOrDefault(k => Builder.IsCompatibleKeyFromScriptCode(k.PubKey, scriptPubKey));
-				if (key == null && Builder.KeyFinder != null)
+				if (key is null && Builder.KeyFinder != null)
 				{
 					key = Builder.KeyFinder(scriptPubKey);
 				}
@@ -447,12 +447,12 @@ namespace NBitcoin
 				set;
 			}
 
-			private List<ICoin> _ConsumedCoins = new List<ICoin>();
-			public List<ICoin> ConsumedCoins
+			private HashSet<OutPoint> _ConsumedOutpoints = new HashSet<OutPoint>();
+			public HashSet<OutPoint> ConsumedOutpoints
 			{
 				get
 				{
-					return _ConsumedCoins;
+					return _ConsumedOutpoints;
 				}
 			}
 			public TransactionBuilder Builder
@@ -534,13 +534,7 @@ namespace NBitcoin
 				_Marker = memento._Marker == null ? null : new ColorMarker(memento._Marker.GetScript());
 				Transaction = memento.Transaction.Clone();
 				AdditionalFees = memento.AdditionalFees;
-				_ConsumedCoins = memento.ConsumedCoins.ToList();
-			}
-
-			public bool NonFinalSequenceSet
-			{
-				get;
-				set;
+				_ConsumedOutpoints = new HashSet<OutPoint>(memento.ConsumedOutpoints);
 			}
 
 			public IMoney? CoverOnly
@@ -728,7 +722,7 @@ namespace NBitcoin
 			set;
 		}
 
-		LockTime? _LockTime;
+		LockTime _LockTime;
 		public TransactionBuilder SetLockTime(LockTime lockTime)
 		{
 			_LockTime = lockTime;
@@ -767,6 +761,11 @@ namespace NBitcoin
 			return this;
 		}
 
+		public TransactionBuilder SetOptInRBF(bool rbf)
+		{
+			OptInRBF = rbf;
+			return this;
+		}
 		public TransactionBuilder AddKnownSignature(PubKey pubKey, ECDSASignature signature, OutPoint signedOutpoint)
 		{
 			if (pubKey == null)
@@ -1401,7 +1400,11 @@ namespace NBitcoin
 		retry:
 			TransactionBuildingContext ctx = new TransactionBuildingContext(this);
 			if (_CompletedTransaction != null)
+			{
 				ctx.Transaction = _CompletedTransaction.Clone();
+				foreach (var input in ctx.Transaction.Inputs)
+					ctx.ConsumedOutpoints.Add(input.PrevOut);
+			}
 			if (_LockTime != null)
 				ctx.Transaction.LockTime = _LockTime.Value;
 			foreach (var group in _BuilderGroups)
@@ -1446,7 +1449,7 @@ namespace NBitcoin
 			// Make some adjustments if we need to send more fees
 			if (StandardTransactionPolicy.MinFee != null)
 			{
-				var consumed = ctx.ConsumedCoins.ToArray();
+				var consumed = ctx.ConsumedOutpoints.Select(c => FindCoin(c)).Where(c => c != null).ToArray();
 				var fee = ctx.Transaction.GetFee(consumed);
 				if (fee != null && fee < StandardTransactionPolicy.MinFee)
 				{
@@ -1489,7 +1492,7 @@ namespace NBitcoin
 				target = ctx.CoverOnly.Add(ctx.ChangeAmount);
 			}
 
-			var unconsumed = coins.Where(c => ctx.ConsumedCoins.All(cc => cc.Outpoint != c.Outpoint)).ToArray();
+			var unconsumed = coins.Where(c => !ctx.ConsumedOutpoints.Contains(c.Outpoint)).ToArray();
 			if (selection == null)
 			{
 				if (group.sendAllToChange)
@@ -1513,39 +1516,41 @@ namespace NBitcoin
 					group.Name,
 					change.Negate()
 				);
-			if (change.CompareTo(ctx.Dust) == 1)
+
+			var changeScript = group.ChangeScript[(int)ctx.ChangeType];
+			var dust = ctx.Dust;
+			if (changeScript != null && dust is Money)
+				dust = GetDust(changeScript);
+			if (change.CompareTo(dust) >= 0 && change.CompareTo(zero) != 0)
 			{
-				var changeScript = group.ChangeScript[(int)ctx.ChangeType];
 				if (changeScript == null)
 					throw new InvalidOperationException("A change address should be specified (" + ctx.ChangeType + ")");
-				if (!(ctx.Dust is Money) || change.CompareTo(GetDust(changeScript)) == 1)
-				{
-					ctx.RestoreMemento(originalCtx);
-					ctx.ChangeAmount = change;
-					goto retry;
-				}
+
+				ctx.RestoreMemento(originalCtx);
+				ctx.ChangeAmount = change;
+				goto retry;
 			}
 			ctx.ChangeAmount = zero;
 			if (ShuffleRandom != null)
 			{
 				Utils.Shuffle(selection, ShuffleRandom);
 			}
+			var inputsPerOutpoints = ctx.Transaction.Inputs.ToDictionary(o => o.PrevOut);
 			foreach (var coin in selection)
 			{
-				ctx.ConsumedCoins.Add(coin);
-				var input = ctx.Transaction.Inputs.FirstOrDefault(i => i.PrevOut == coin.Outpoint);
-				if (input == null)
+				ctx.ConsumedOutpoints.Add(coin.Outpoint);
+				if (!inputsPerOutpoints.TryGetValue(coin.Outpoint, out var input))
+				{
 					input = ctx.Transaction.Inputs.Add(coin.Outpoint);
-
+					inputsPerOutpoints.Add(coin.Outpoint, input);
+				}
 				if (OptInRBF)
 				{
 					input.Sequence = Sequence.OptInRBF;
-					ctx.NonFinalSequenceSet = true;
 				}
-				if (_LockTime != null && !ctx.NonFinalSequenceSet)
+				else if (_LockTime != LockTime.Zero)
 				{
-					input.Sequence = 0;
-					ctx.NonFinalSequenceSet = true;
+					input.Sequence = Sequence.FeeSnipping;
 				}
 			}
 			if (MergeOutputs && !hasColoredCoins)
@@ -2009,9 +2014,9 @@ namespace NBitcoin
 			if (coin is StealthCoin stealthCoin)
 			{
 				var scanKey = ctx.FindKey(stealthCoin.Address.ScanPubKey.ScriptPubKey);
-				if (scanKey == null)
+				if (scanKey is null)
 					throw new KeyNotFoundException("Scan key for decrypting StealthCoin not found");
-				var spendKeys = stealthCoin.Address.SpendPubKeys.Select(p => ctx.FindKey(p.ScriptPubKey)).Where(p => p != null).ToArray();
+				var spendKeys = stealthCoin.Address.SpendPubKeys.Select(p => ctx.FindKey(p.ScriptPubKey)).Where(p => !(p is null)).ToArray();
 				ctx.AdditionalKeys.AddRange(stealthCoin.Uncover(spendKeys, scanKey));
 				var normalCoin = new Coin(coin.Outpoint, coin.TxOut);
 				if (stealthCoin.Redeem != null)

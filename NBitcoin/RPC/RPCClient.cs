@@ -334,6 +334,7 @@ namespace NBitcoin.RPC
 			SetVersion(capabilities),
 			CheckCapabilities(rpc, "scantxoutset", v => capabilities.SupportScanUTXOSet = v),
 			CheckCapabilities(rpc, "signrawtransactionwithkey", v => capabilities.SupportSignRawTransactionWith = v),
+			CheckCapabilities(rpc, "testmempoolaccept", v => capabilities.SupportTestMempoolAccept = v),
 			CheckCapabilities(rpc, "estimatesmartfee", v => capabilities.SupportEstimateSmartFee = v),
 			CheckCapabilities(rpc, "generatetoaddress", v => capabilities.SupportGenerateToAddress = v),
 			CheckSegwitCapabilities(rpc, v => capabilities.SupportSegwit = v));
@@ -342,6 +343,13 @@ namespace NBitcoin.RPC
 #if !NETSTANDARD1X
 			Thread.MemoryBarrier();
 #endif
+			if (!capabilities.SupportGetNetworkInfo)
+			{
+#pragma warning disable CS0618 // Type or member is obsolete
+				var getInfo = await SendCommandAsync(RPCOperations.getinfo);
+#pragma warning restore CS0618 // Type or member is obsolete
+				capabilities.Version = ((JObject)getInfo.Result)["version"].Value<int>();
+			}
 			Capabilities = capabilities;
 			return capabilities;
 		}
@@ -358,13 +366,6 @@ namespace NBitcoin.RPC
 			catch (RPCException ex) when (ex.RPCCode == RPCErrorCode.RPC_METHOD_NOT_FOUND || ex.RPCCode == RPCErrorCode.RPC_METHOD_DEPRECATED)
 			{
 				capabilities.SupportGetNetworkInfo = false;
-			}
-
-			{
-#pragma warning disable CS0618 // Type or member is obsolete
-				var getInfo = await SendCommandAsync(RPCOperations.getinfo);
-#pragma warning restore CS0618 // Type or member is obsolete
-				capabilities.Version = ((JObject)getInfo.Result)["version"].Value<int>();
 			}
 		}
 
@@ -395,6 +396,10 @@ namespace NBitcoin.RPC
 			{
 				setResult(ex.RPCCode == RPCErrorCode.RPC_TYPE_ERROR);
 			}
+			catch
+			{
+				setResult(false);
+			}
 		}
 
 		private static async Task CheckCapabilities(Func<Task> command, Action<bool> setResult)
@@ -411,6 +416,10 @@ namespace NBitcoin.RPC
 			catch (RPCException)
 			{
 				setResult(true);
+			}
+			catch
+			{
+				setResult(false);
 			}
 		}
 		private static Task CheckCapabilities(RPCClient rpc, string command, Action<bool> setResult)
@@ -889,6 +898,7 @@ namespace NBitcoin.RPC
 			throw new NotSupportedException("Cookie authentication is not supported for this platform");
 #endif
 		}
+
 		static Encoding NoBOMUTF8 = new UTF8Encoding(false);
 		async Task<RPCResponse> SendCommandAsyncCore(RPCRequest request, bool throwIfRPCError)
 		{
@@ -912,6 +922,9 @@ namespace NBitcoin.RPC
 				var writer = new StringWriter();
 				request.WriteJSON(writer);
 				writer.Flush();
+				bool renewedCookie = false;
+				TimeSpan retryTimeout = TimeSpan.FromSeconds(1.0);
+				TimeSpan maxRetryTimeout = TimeSpan.FromSeconds(10.0);
 			retry:
 				var webRequest = CreateWebRequest(writer.ToString());
 				using (var cts = new CancellationTokenSource(RequestTimeout))
@@ -928,24 +941,48 @@ namespace NBitcoin.RPC
 						{
 							if (httpResponse.StatusCode == HttpStatusCode.Unauthorized)
 							{
-								if (TryRenewCookie())
+								if (!renewedCookie && TryRenewCookie())
+								{
+									renewedCookie = true;
 									goto retry;
+								}
 								httpResponse.EnsureSuccessStatusCode(); // Let's throw
 							}
-							if (httpResponse.Content == null ||
-								(httpResponse.Content.Headers.ContentLength == null || httpResponse.Content.Headers.ContentLength.Value == 0) ||
-								!httpResponse.Content.Headers.ContentType.MediaType.Equals("application/json", StringComparison.Ordinal))
+							if (IsJson(httpResponse))
+							{
+								response = RPCResponse.Load(await httpResponse.Content.ReadAsStreamAsync());
+								if (throwIfRPCError)
+									response.ThrowIfError();
+							}
+							else if (await IsWorkQueueFull(httpResponse))
+							{
+								await Task.Delay(retryTimeout, cts.Token);
+								retryTimeout = TimeSpan.FromTicks(retryTimeout.Ticks * 2);
+								if (retryTimeout > maxRetryTimeout)
+									retryTimeout = maxRetryTimeout;
+								goto retry;
+							}
+							else
 							{
 								httpResponse.EnsureSuccessStatusCode(); // Let's throw
 							}
-							response = RPCResponse.Load(await httpResponse.Content.ReadAsStreamAsync());
-							if (throwIfRPCError)
-								response.ThrowIfError();
 						}
 					}
 				}
 			}
 			return response;
+		}
+
+		private bool IsJson(HttpResponseMessage httpResponse)
+		{
+			return httpResponse.Content?.Headers?.ContentType?.MediaType?.Equals("application/json", StringComparison.Ordinal) is true;
+		}
+
+		private async Task<bool> IsWorkQueueFull(HttpResponseMessage httpResponse)
+		{
+			if (httpResponse.StatusCode != HttpStatusCode.InternalServerError)
+				return false;
+			return (await httpResponse.Content?.ReadAsStringAsync())?.Equals("Work queue depth exceeded", StringComparison.Ordinal) is true;
 		}
 
 		private HttpRequestMessage CreateWebRequest(string json)
@@ -1511,20 +1548,27 @@ namespace NBitcoin.RPC
 			var first = response.Result[0];
 			var allowed = first["allowed"].Value<bool>();
 
-			var rejectedCode = 0;
+			RejectCode rejectedCode = RejectCode.INVALID;
 			var rejectedReason = string.Empty;
 			if (!allowed)
 			{
 				var rejected = first["reject-reason"].Value<string>();
-				var separatorIdx = rejected.IndexOf(":");
-				rejectedCode = int.Parse(rejected.Substring(0, separatorIdx));
-				rejectedReason = rejected.Substring(separatorIdx + 2);
+				var separatorIdx = rejected.IndexOf(':');
+				if (separatorIdx != -1)
+				{
+					rejectedCode = (RejectCode)int.Parse(rejected.Substring(0, separatorIdx));
+					rejectedReason = rejected.Substring(separatorIdx + 2);
+				}
+				else
+				{
+					rejectedReason = rejected;
+				}
 			}
 			return new MempoolAcceptResult
 			{
 				TxId = uint256.Parse(first["txid"].Value<string>()),
 				IsAllowed = allowed,
-				RejectCode = (RejectCode)rejectedCode,
+				RejectCode = rejectedCode,
 				RejectReason = rejectedReason
 			};
 		}

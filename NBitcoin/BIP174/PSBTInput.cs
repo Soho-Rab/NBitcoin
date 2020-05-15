@@ -234,12 +234,9 @@ namespace NBitcoin
 		{
 			if (coin == null)
 				throw new ArgumentNullException(nameof(coin));
-			if (IsFinalized())
-				throw new InvalidOperationException("Impossible to modify the PSBTInput if it has been finalized");
 			if (coin.Outpoint != PrevOut)
 				throw new ArgumentException("This coin does not match the input", nameof(coin));
-			if (IsFinalized())
-				return;
+			
 			if (coin is ScriptCoin scriptCoin)
 			{
 				if (scriptCoin.RedeemType == RedeemType.P2SH)
@@ -287,7 +284,6 @@ namespace NBitcoin
 					}
 				}
 			}
-
 			if (Parent.Network.Consensus.NeverNeedPreviousTxForSigning ||
 				coin.GetHashVersion() == HashVersion.Witness || witness_script != null)
 			{
@@ -299,12 +295,18 @@ namespace NBitcoin
 				orphanTxOut = coin.TxOut;
 				witness_utxo = null;
 			}
+			if (IsFinalized())
+				ClearForFinalize();
 		}
 
-		internal void Combine(PSBTInput other)
+		/// <summary>
+		/// Import informations contained by <paramref name="other"/> into this instance.
+		/// </summary>
+		/// <param name="other"></param>
+		public void UpdateFrom(PSBTInput other)
 		{
-			if (this.IsFinalized())
-				return;
+			if (other == null)
+				throw new ArgumentNullException(nameof(other));
 
 			foreach (var uk in other.unknown)
 				unknown.TryAdd(uk.Key, uk.Value);
@@ -315,17 +317,12 @@ namespace NBitcoin
 
 			if (other.final_script_witness != null)
 				final_script_witness = other.final_script_witness;
-			if (IsFinalized())
-			{
-				ClearForFinalize();
-				return;
-			}
 
 			if (non_witness_utxo == null && other.non_witness_utxo != null)
 				non_witness_utxo = other.non_witness_utxo;
 
 			if (witness_utxo == null && other.witness_utxo != null)
-				non_witness_utxo = other.non_witness_utxo;
+				witness_utxo = other.witness_utxo;
 
 			if (sighash_type == 0 && other.sighash_type > 0)
 				sighash_type = other.sighash_type;
@@ -342,6 +339,8 @@ namespace NBitcoin
 			foreach (var keyPath in other.hd_keypaths)
 				hd_keypaths.TryAdd(keyPath.Key, keyPath.Value);
 
+			if (IsFinalized())
+				ClearForFinalize();
 		}
 
 		public bool IsFinalized() => final_script_sig != null || final_script_witness != null;
@@ -374,10 +373,14 @@ namespace NBitcoin
 		}
 
 		/// <summary>
+		/// Delete superflous information from a finalized input.
 		/// This will not clear utxos since tx extractor might want to check the validity
 		/// </summary>
-		internal void ClearForFinalize()
+		/// <exception cref="System.InvalidOperationException">The input need to be finalized</exception>
+		public void ClearForFinalize()
 		{
+			if (!IsFinalized())
+				throw new InvalidOperationException("The input need to be finalized");
 			this.redeem_script = null;
 			this.witness_script = null;
 			this.partial_sigs.Clear();
@@ -393,6 +396,53 @@ namespace NBitcoin
 				return null;
 			}
 			return base.GetSignableCoin(out error);
+		}
+
+		internal override Script GetRedeemScript()
+		{
+			var redeemScript = base.GetRedeemScript();
+			if (redeemScript != null)
+				return redeem_script;
+			if (FinalScriptSig is null)
+				return null;
+			var coin = GetCoin();
+			if (coin is null)
+				return null;
+			var scriptId = PayToScriptHashTemplate.Instance.ExtractScriptPubKeyParameters(coin.ScriptPubKey);
+			if (scriptId is null)
+				return null;
+			return PayToScriptHashTemplate.Instance.ExtractScriptSigParameters(FinalScriptSig, scriptId)?.RedeemScript;
+		}
+
+		internal override Script GetWitnessScript()
+		{
+			var witnessScript = base.GetWitnessScript();
+			if (witnessScript != null)
+				return witness_script;
+			if (FinalScriptWitness is null)
+				return null;
+			var coin = GetCoin();
+			if (coin is null)
+				return null;
+			var witScriptId = PayToWitScriptHashTemplate.Instance.ExtractScriptPubKeyParameters(coin.ScriptPubKey);
+			if (witScriptId != null)
+			{
+				return PayToWitScriptHashTemplate.Instance.ExtractWitScriptParameters(FinalScriptWitness, witScriptId);
+			}
+			// Maybe wrapped P2SH
+			if (FinalScriptSig is null)
+				return null;
+			var scriptId = PayToScriptHashTemplate.Instance.ExtractScriptPubKeyParameters(coin.ScriptPubKey);
+			if (scriptId is null)
+				return null;
+			var p2shRedeem = PayToScriptHashTemplate.Instance.ExtractScriptSigParameters(FinalScriptSig, scriptId)
+				?.RedeemScript;
+			if (p2shRedeem is null)
+				return null;
+			witScriptId = PayToWitScriptHashTemplate.Instance.ExtractScriptPubKeyParameters(p2shRedeem);
+			if (witScriptId is null)
+				return null;
+			return PayToWitScriptHashTemplate.Instance.ExtractWitScriptParameters(FinalScriptWitness, witScriptId);
 		}
 
 		public IList<PSBTError> CheckSanity()
@@ -790,6 +840,8 @@ namespace NBitcoin
 		}
 		public TransactionSignature Sign(Key key, SigHash sigHash)
 		{
+			if (this.IsFinalized())
+				return null;
 			CheckCompatibleSigHash(sigHash);
 			if (PartialSigs.ContainsKey(key.PubKey))
 			{

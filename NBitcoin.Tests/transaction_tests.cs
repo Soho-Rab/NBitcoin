@@ -1,5 +1,4 @@
 ﻿using NBitcoin.Altcoins.Elements;
-using NBitcoin.BouncyCastle.Math;
 using NBitcoin.Crypto;
 using NBitcoin.DataEncoders;
 using NBitcoin.OpenAsset;
@@ -308,7 +307,7 @@ namespace NBitcoin.Tests
 				Assert.Null(wallet.SelectCoinsMinConf(Money.Cents(1), filter_standard, out setCoinsRet, out nValueRet));
 
 				wallet.AddCoin(Money.Cents(1), 4);        // add a new 1 cent coin
-				
+
 				// with a new 1 cent coin, we still can't find a mature 1 cent
 				Assert.Null(wallet.SelectCoinsMinConf(Money.Cents(1), filter_standard, out setCoinsRet, out nValueRet));
 
@@ -1324,6 +1323,78 @@ namespace NBitcoin.Tests
 
 		[Fact]
 		[Trait("UnitTest", "UnitTest")]
+		public void CorrectFeeAfterAnyoneCanPay()
+		{
+			var network = Network.Main;
+			var feeRate = new FeeRate(1_000L);
+			var tokenValue = 5_500L;
+			var tokenPrice = 10_000L;
+
+			OutPoint tokenOutpoint = null;
+			Script tokenOwnerScriptPubKey = null;
+			Script tokenAnyoneCanPayScript = null;
+
+			// create token with anyone can pay signature
+			{
+				var privateKey = new Key();
+				tokenOwnerScriptPubKey = privateKey.PubKey.Hash.ScriptPubKey;
+
+				Coin token = CreateCoin(tokenValue, tokenOwnerScriptPubKey);
+				tokenOutpoint = token.Outpoint;
+
+				var txbuilder = new TransactionBuilder(network);
+
+				txbuilder
+					.AddCoins(token)
+					.CoverOnly(token.Amount)
+					.Send(tokenOwnerScriptPubKey, new Money(tokenPrice));
+				Transaction tx = txbuilder.BuildTransaction(false);
+
+				// sign with anyone can pay
+				tx = txbuilder.AddKeys(privateKey).SignTransaction(tx, SigHash.AnyoneCanPay | SigHash.Single);
+
+				// extract signature
+				tokenAnyoneCanPayScript = tx.Inputs[0].ScriptSig;
+			}
+
+			// another key tries to consume this token
+			{
+				var toComplete = network.Consensus.ConsensusFactory.CreateTransaction();
+				TxIn in0 = new TxIn(tokenOutpoint, tokenAnyoneCanPayScript);
+				TxOut out0 = new TxOut(Money.FromUnit(tokenPrice, MoneyUnit.Satoshi), tokenOwnerScriptPubKey);
+				toComplete.Inputs.Add(in0);
+				toComplete.Outputs.Add(out0);
+
+				var privateKey = new Key();
+				var tokenBuyerScriptPubKey = privateKey.PubKey.Hash.ScriptPubKey;
+				var tokenCoin = new Coin(tokenOutpoint, new TxOut(tokenValue, tokenOwnerScriptPubKey));
+				var coins = new ICoin[] { CreateCoin(5_500L, tokenBuyerScriptPubKey) };
+				var txbuilder = new TransactionBuilder(network);
+				var signed = txbuilder
+					.ContinueToBuild(toComplete)
+					.AddCoins(tokenCoin)
+					.AddCoins(coins)
+					.CoverTheRest()
+					.SetChange(tokenBuyerScriptPubKey)
+					.SendEstimatedFees(feeRate)
+					.BuildTransaction(false);
+
+				// sign and verify
+				signed = txbuilder.AddKeys(new Key[] { privateKey }).SignTransaction(signed);
+
+				var estimatedFees = txbuilder.EstimateFees(feeRate);
+				var fee = signed.GetFee(txbuilder.FindSpentCoins(signed));
+				Assert.Equal(tokenAnyoneCanPayScript, signed.Inputs[0].ScriptSig);
+				Assert.Equal(estimatedFees, fee);
+
+				bool result = txbuilder.Verify(signed, out TransactionPolicyError[] errors);
+				Assert.True(result);
+
+			}
+		}
+
+		[Fact]
+		[Trait("UnitTest", "UnitTest")]
 		public void CanBuildStealthTransaction()
 		{
 			var stealthKeys = Enumerable.Range(0, 3).Select(_ => new Key()).ToArray();
@@ -1624,6 +1695,56 @@ namespace NBitcoin.Tests
 		{
 			var outpoint = RandOutpoint();
 			return new Coin(outpoint, new TxOut(amount, receiver));
+		}
+
+		[Fact]
+		[Trait("UnitTest", "UnitTest")]
+		public void CanGetFinalizedHashFromPSBT()
+		{
+			var tx = Network.Main.CreateTransaction();
+			Key alice = new Key();
+			var sw = alice.PubKey.GetScriptPubKey(ScriptPubKeyType.Segwit);
+			var p2sh = alice.PubKey.GetScriptPubKey(ScriptPubKeyType.SegwitP2SH);
+			var leg = alice.PubKey.GetScriptPubKey(ScriptPubKeyType.Legacy);
+			var swc = new Coin(RandOutpoint(), new TxOut(Money.Coins(1.0m), sw));
+			var p2shc = new Coin(RandOutpoint(), new TxOut(Money.Coins(1.1m), p2sh)).ToScriptCoin(sw);
+
+			var prevTx = Network.Main.CreateTransaction();
+			prevTx.Inputs.Add(RandOutpoint());
+			prevTx.Outputs.Add(Money.Coins(1.2m), leg);
+			var legc = prevTx.Outputs.AsCoins().First();
+			tx.Inputs.Add(swc.Outpoint);
+			tx.Inputs.Add(p2shc.Outpoint);
+			tx.Outputs.Add(new TxOut(Money.Coins(1.0m), new Key().PubKey.ScriptPubKey));
+			var psbt = PSBT.FromTransaction(tx, Network.Main);
+			psbt.AddCoins(swc, p2shc);
+
+			// Missing redeem script for p2shc
+			psbt.Inputs[1].RedeemScript = null;
+			uint256 expectedHash = null;
+			Assert.False(psbt.TryGetFinalizedHash(out expectedHash));
+			Assert.Null(expectedHash);
+			psbt.Inputs[1].RedeemScript = p2shc.GetP2SHRedeem();
+			Assert.True(psbt.TryGetFinalizedHash(out expectedHash));
+			Assert.NotNull(expectedHash);
+			psbt.SignWithKeys(alice);
+			psbt.Finalize();
+			Assert.Equal(expectedHash, psbt.ExtractTransaction().GetHash());
+
+			// Missing the signature of the legacy
+			tx.Inputs.Add(legc.Outpoint);
+			psbt = PSBT.FromTransaction(tx, Network.Main);
+			psbt.AddCoins(swc, p2shc);
+			psbt.AddTransactions(prevTx);
+			Assert.False(psbt.TryGetFinalizedHash(out expectedHash));
+			Assert.Null(expectedHash);
+			psbt.Inputs[2].Sign(alice);
+			psbt.Inputs[2].FinalizeInput();
+			Assert.True(psbt.TryGetFinalizedHash(out expectedHash));
+			Assert.NotNull(expectedHash);
+			psbt.SignWithKeys(alice);
+			psbt.Finalize();
+			Assert.Equal(expectedHash, psbt.ExtractTransaction().GetHash());
 		}
 
 		[Fact]
@@ -2037,6 +2158,30 @@ namespace NBitcoin.Tests
 			var signed = txBuilder.BuildPSBT(true);
 			signed.TryGetFee(out var fee);
 			Assert.Equal(fee, Money.Coins(1.0m));
+		}
+
+		[Fact]
+		[Trait("UnitTest", "UnitTest")]
+		public void AssertCanSendBackSmallSegwitChange()
+		{
+			var k = new Key();
+			var txBuilder = Bitcoin.Instance.Regtest.CreateTransactionBuilder();
+			txBuilder.AddCoins(RandomCoin(Money.Satoshis(1000), k.PubKey.WitHash));
+			txBuilder.Send(new Key().ScriptPubKey, Money.Satoshis(600));
+			txBuilder.SetChange(new Key().PubKey.WitHash);
+			// The dust should be 294, so should have 2 outputs
+			txBuilder.SendFees(Money.Satoshis(400 - 294));
+			var signed = txBuilder.BuildPSBT(false);
+			Assert.Equal(2, signed.Outputs.Count);
+
+			txBuilder = Bitcoin.Instance.Regtest.CreateTransactionBuilder();
+			txBuilder.AddCoins(RandomCoin(Money.Satoshis(1000), k.PubKey.WitHash));
+			txBuilder.Send(new Key().ScriptPubKey, Money.Satoshis(600));
+			txBuilder.SetChange(new Key().PubKey.WitHash);
+			// The dust should be 293, so should have 1 outputs
+			txBuilder.SendFees(Money.Satoshis(400 - 293));
+			signed = txBuilder.BuildPSBT(false);
+			Assert.Single(signed.Outputs);
 		}
 
 		[Fact]
@@ -2550,6 +2695,7 @@ namespace NBitcoin.Tests
 			TransactionBuilder builder = Network.CreateTransactionBuilder();
 			builder.StandardTransactionPolicy = EasyPolicy;
 			builder.AddCoins(funding.Outputs.AsCoins());
+			builder.Verify(spending, out var errs);
 			Assert.True(builder.Verify(spending));
 
 			foreach (var input in spending.Inputs.AsIndexedInputs())
@@ -2968,24 +3114,6 @@ namespace NBitcoin.Tests
 			psbt.Finalize();
 
 			psbt.TryGetEstimatedFeeRate(out FeeRate actualFeeRate);
-		}
-
-		protected virtual BigInteger CalculateE(BigInteger n, byte[] message)
-		{
-			int messageBitLength = message.Length * 8;
-			BigInteger trunc = new BigInteger(1, message);
-
-			if (n.BitLength < messageBitLength)
-			{
-				trunc = trunc.ShiftRight(messageBitLength - n.BitLength);
-			}
-
-			return trunc;
-		}
-
-		private ECDSASignature ToPositive(ECDSASignature sig)
-		{
-			return new ECDSASignature(new BouncyCastle.Math.BigInteger(1, sig.R.ToByteArray()), new BouncyCastle.Math.BigInteger(1, sig.S.ToByteArray()));
 		}
 
 		public enum HashModification
